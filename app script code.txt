@@ -1,0 +1,1964 @@
+var FONT_FAMILY = 'Calibri';
+var SIZE_BODY = 11;
+var SIZE_H3 = 12;
+var SIZE_H2 = 14;
+var SIZE_H1 = 16;
+var SIZE_INLINE_BOLD = 12;
+var LINE_SPACING = 1.0;
+var SPACE_BEFORE_CONTENT = 1.0;
+var SPACE_AFTER_CONTENT = 1.0;
+var SECRET_KEY = 'sherii';
+var SCRIPT_PROPS = PropertiesService.getScriptProperties();
+
+/*
+PHASE → LAYOUT MAP (authoritative)
+----------------------------------
+FULL-WIDTH ONLY (never double columns):
+  - front_author_intro
+  - front_copyright
+  - front_how_to_use
+  - front_why_trust
+  - overview_d
+  - purpose_d
+  - target_covered_d
+  - memory_check_d
+  - domain content pages (labels like d1_s1_p1, d2_s3_p2, etc.)
+  - practice_q
+
+ALWAYS FULL-WIDTH BLOCK TYPES (all phases):
+  - TABLE
+  - FIGURE
+  - INLINE_IMAGE
+  - H1 / H2 headings
+
+IMAGE PLACEHOLDER:
+  - If no image data/src exists, insert a full-width boxed placeholder table.
+*/
+
+var FRONT_H1_TITLES = [
+  'author introduction',
+  'copyright',
+  'how to use this book',
+  'why trust this book',
+  'why trust this study guide'
+];
+
+function doGet() {
+  return _json({
+    status: 'ok',
+    app: 'super script',
+    message: 'ready'
+  });
+}
+
+function doPost(e) {
+  try {
+    var payload = JSON.parse((e && e.postData && e.postData.contents) ? e.postData.contents : '{}');
+    var action = String(payload.action || 'append').toLowerCase();
+    if (!payload.docId) return _json({ status: 'error', message: 'Missing docId' });
+    if (String(payload.secret || '') !== SECRET_KEY) {
+      return _json({ status: 'error', message: 'Invalid secret' });
+    }
+
+    if (action === 'ping') {
+      var doc = DocumentApp.openById(payload.docId);
+      return _json({ status: 'ok', title: doc.getName() });
+    }
+
+    if (action === 'append') {
+      appendFormattedContent(payload.docId, payload.content, payload.section || '');
+      return _json({ status: 'ok', message: 'content posted' });
+    }
+
+    if (action === 'appendimage') {
+      appendImage(payload.docId, payload);
+      return _json({ status: 'ok', message: 'image posted' });
+    }
+
+    return _json({ status: 'error', message: 'Unknown action' });
+  } catch (err) {
+    return _json({ status: 'error', message: err.message });
+  }
+}
+
+function _json(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function appendFormattedContent(docId, rawContent, section) {
+  var doc = DocumentApp.openById(docId);
+  var body = doc.getBody();
+
+  var normalized = _extractTextFromMaybeJson(rawContent);
+  var rebuiltFromStructured = _rebuildStructuredQuestionPayload(rawContent, section);
+  if (rebuiltFromStructured) normalized = rebuiltFromStructured;
+  normalized = _normalizeInputText(normalized);
+  normalized = _ensureMandatoryDisclaimer(normalized, section);
+  if (!normalized) {
+    doc.saveAndClose();
+    return;
+  }
+
+  // Practice sections now follow the same normal render pipeline.
+
+  var ctx = {
+    docId: String(docId || '').trim()
+  };
+
+  var blocks = _parseBlocks(normalized);
+  blocks = _wrapDisplayMathBlocks(blocks);
+  var isPracticeSection = _isPracticeSection(section);
+  var isFrSection = _isFreeResponseSection(section);
+  if ((isPracticeSection || isFrSection) && !_containsQuestionLikeBlock(blocks)) {
+    // Never silently drop assessment payloads. If parser could not build
+    // QUESTION/FREE_RESPONSE blocks, force a plain-line render fallback.
+    _renderPlainMultiline(body, normalized, section);
+    doc.saveAndClose();
+    return;
+  }
+  // Keep GPT paragraph flow intact; do not auto-chunk long prose.
+  // blocks = _splitLongParagraphBlocks(blocks);
+  _renderBlocksWithLayout(body, blocks, section, ctx);
+
+  doc.saveAndClose();
+}
+
+function _isPracticeSection(section) {
+  var s = String(section || '').toLowerCase();
+  return s.indexOf('practice questions') !== -1 || s.indexOf('practice_q') !== -1;
+}
+
+function _isFreeResponseSection(section) {
+  var s = String(section || '').toLowerCase();
+  return s.indexOf('free response') !== -1 || s.indexOf('free_response') !== -1;
+}
+
+function _containsQuestionLikeBlock(blocks) {
+  if (!Array.isArray(blocks) || !blocks.length) return false;
+  for (var i = 0; i < blocks.length; i++) {
+    var b = blocks[i];
+    if (!b) continue;
+    if (b.type === 'QUESTION' || b.type === 'FREE_RESPONSE') return true;
+  }
+  return false;
+}
+
+function _renderPlainMultiline(body, text, section) {
+  var s = String(text || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+  if (!s) return;
+  var lines = s.split('\n');
+  for (var i = 0; i < lines.length; i++) {
+    var ln = String(lines[i] || '');
+    if (!ln.trim()) {
+      var gap = body.appendParagraph('');
+      gap.setFontFamily(FONT_FAMILY);
+      gap.setFontSize(SIZE_BODY);
+      gap.setSpacingBefore(0);
+      gap.setSpacingAfter(0);
+      _clearUnderlineInParagraph(gap);
+      continue;
+    }
+    if (/^#{1,6}\s+/.test(ln.trim())) {
+      var h = body.appendParagraph(ln.trim().replace(/^#{1,6}\s+/, ''));
+      h.setHeading(DocumentApp.ParagraphHeading.HEADING3);
+      h.setFontFamily(FONT_FAMILY);
+      h.setFontSize(SIZE_H3);
+      h.setBold(true);
+      h.setSpacingBefore(SPACE_BEFORE_CONTENT);
+      h.setSpacingAfter(SPACE_AFTER_CONTENT);
+      _clearUnderlineInParagraph(h);
+      continue;
+    }
+    var p = body.appendParagraph(ln);
+    p.setHeading(DocumentApp.ParagraphHeading.NORMAL);
+    p.setFontFamily(FONT_FAMILY);
+    p.setFontSize(SIZE_BODY);
+    p.setLineSpacing(LINE_SPACING);
+    p.setBold(false);
+    p.setSpacingBefore(SPACE_BEFORE_CONTENT);
+    p.setSpacingAfter(SPACE_AFTER_CONTENT);
+    p.setAlignment(DocumentApp.HorizontalAlignment.LEFT);
+    _clearUnderlineInParagraph(p);
+  }
+}
+
+function _renderPracticeStrict(body, text) {
+  var src = String(text || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  var lines = src.split('\n');
+  var i = 0;
+  var wroteAny = false;
+
+  while (i < lines.length) {
+    var t = String(lines[i] || '').trim();
+    var qMatch = t.match(/^Q(?:no\.?)?\s*(\d+)[\.\)]\s+(.+)$/i) || t.match(/^Q\s*(\d+)[\.\)]\s+(.+)$/i);
+    if (!qMatch) { i++; continue; }
+
+    var qObj = {
+      q: 'Q' + qMatch[1] + '. ' + String(qMatch[2] || '').trim(),
+      options: [],
+      ans: '',
+      exp: ''
+    };
+    i++;
+
+    while (i < lines.length) {
+      var ln = String(lines[i] || '').trim();
+      if (!ln) { i++; continue; }
+      if (/^=+$/.test(ln)) { i++; break; }
+      if ((/^Q(?:no\.?)?\s*\d+[\.\)]\s+/i.test(ln)) || (/^Q\s*\d+[\.\)]\s+/i.test(ln))) break;
+
+      var opt = ln.match(/^\(([A-Z])\)\s+(.+)$/);
+      if (opt) {
+        qObj.options.push('(' + opt[1] + ') ' + String(opt[2] || '').trim());
+        i++;
+        continue;
+      }
+      if (/^Answer\s*:/i.test(ln)) {
+        qObj.ans = 'Answer: ' + ln.replace(/^Answer\s*:\s*/i, '').trim();
+        i++;
+        continue;
+      }
+      if (/^Explanation\s*:/i.test(ln)) {
+        var exp = ln.replace(/^Explanation\s*:\s*/i, '').trim();
+        i++;
+        while (i < lines.length) {
+          var nx = String(lines[i] || '').trim();
+          if (!nx) { i++; continue; }
+          if (/^=+$/.test(nx)) { i++; break; }
+          if ((/^Q(?:no\.?)?\s*\d+[\.\)]\s+/i.test(nx)) || (/^Q\s*\d+[\.\)]\s+/i.test(nx))) break;
+          if (/^\(([A-Z])\)\s+/.test(nx) || /^Answer\s*:/i.test(nx)) break;
+          exp += ' ' + nx;
+          i++;
+        }
+        qObj.exp = 'Explanation: ' + exp.trim();
+        continue;
+      }
+      i++;
+    }
+
+    if (qObj.q && qObj.options.length) {
+      _renderQuestion(body, qObj);
+      wroteAny = true;
+    }
+  }
+
+  if (!wroteAny) {
+    // fallback: still ensure plain non-bold lines instead of inheriting random style
+    _renderPlainMultiline(body, src, 'practice_strict_fallback');
+  }
+}
+
+function _renderBlocksWithLayout(body, blocks, section, ctx) {
+  // Hard lock: always render in single full-width flow.
+  for (var i = 0; i < blocks.length; i++) {
+    var b = blocks[i];
+    var prev = i > 0 ? blocks[i - 1] : null;
+    var next = i < blocks.length - 1 ? blocks[i + 1] : null;
+    _renderBlock(body, b, section, prev, next, ctx, blocks, i);
+  }
+}
+
+function _flushTwoColumnBuffer(body, items, section, ctx) {
+  if (!items || !items.length) return;
+  // Single-column locked mode: render sequentially in full width.
+  for (var i = 0; i < items.length; i++) {
+    var it = items[i];
+    _renderBlock(body, it.block, section, it.prev, it.next, ctx, it.blocks, it.blockIndex);
+  }
+}
+
+function _isFullWidthBlock(block, section) {
+  if (_isFrontMatterSection(section)) return true;
+  if (!block) return true;
+  if (block.type === 'TABLE' || block.type === 'FIGURE' || block.type === 'INLINE_IMAGE') return true;
+  if (block.type === 'H1' || block.type === 'H2') return true;
+  if (block.type === 'H3' && _isPracticeHeading(block.text)) return true;
+
+  // Overview / Purpose / Target Covered / Memory Check should stay full width.
+  var s = String(section || '').toLowerCase();
+  if (s.indexOf('overview') !== -1 ||
+      s.indexOf('purpose') !== -1 ||
+      s.indexOf('target') !== -1 ||
+      s.indexOf('memory') !== -1) return true;
+
+  return false;
+}
+
+function _isFrontMatterSection(section) {
+  var s = String(section || '').toLowerCase();
+  return s.indexOf('front_author_intro') === 0 ||
+         s.indexOf('front_copyright') === 0 ||
+         s.indexOf('front_how_to_use') === 0 ||
+         s.indexOf('front_why_trust') === 0;
+}
+
+
+function _extractTextFromMaybeJson(rawContent) {
+  if (rawContent === null || rawContent === undefined) return '';
+  if (typeof rawContent !== 'string') {
+    return _flattenJsonText(rawContent).trim();
+  }
+
+  var text = String(rawContent).trim();
+  if (!text) return '';
+
+  var looksJson = (text.charAt(0) === '{' && text.charAt(text.length - 1) === '}') ||
+    (text.charAt(0) === '[' && text.charAt(text.length - 1) === ']');
+  if (!looksJson) return text;
+
+  try {
+    var parsed = JSON.parse(text);
+    return _flattenJsonText(parsed).trim();
+  } catch (_) {
+    return text;
+  }
+}
+
+function _flattenJsonText(node) {
+  if (node === null || node === undefined) return '';
+  if (typeof node === 'string') return node;
+  if (typeof node === 'number' || typeof node === 'boolean') return String(node);
+
+  if (Array.isArray(node)) {
+    var arr = [];
+    for (var i = 0; i < node.length; i++) {
+      var part = _flattenJsonText(node[i]).trim();
+      if (part) arr.push(part);
+    }
+    return arr.join('\n');
+  }
+
+  var priorityKeys = ['content', 'text', 'markdown', 'message', 'response', 'body', 'output'];
+  for (var k = 0; k < priorityKeys.length; k++) {
+    if (Object.prototype.hasOwnProperty.call(node, priorityKeys[k])) {
+      var picked = _flattenJsonText(node[priorityKeys[k]]).trim();
+      if (picked) return picked;
+    }
+  }
+
+  var parts = [];
+  for (var key in node) {
+    if (!Object.prototype.hasOwnProperty.call(node, key)) continue;
+    var v = _flattenJsonText(node[key]).trim();
+    if (v) parts.push(v);
+  }
+  return parts.join('\n');
+}
+
+function _normalizeInputText(text) {
+  var s = String(text || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/^\uFEFF/, '')
+    // Remove content markers anywhere (start/end/middle) so they never leak to Doc.
+    .replace(/\$C\b/gmi, '');
+  return s
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+/**
+ * LaTeX display delimiters $$ ... $$ — strip for Doc text. Table rows (| a | b |) must
+ * be protected: multiline $$ replacement can otherwise merge table cells/rows.
+ */
+function _stripDisplayMathDelimiters(text) {
+  var s = String(text || '');
+  var lines = s.split('\n');
+  var placeholders = [];
+  var outLines = [];
+  for (var li = 0; li < lines.length; li++) {
+    var raw = lines[li];
+    var tr = String(raw || '').trim();
+    if (_isTableLine(tr)) {
+      outLines.push('__SG_TABLELINE_' + placeholders.length + '__');
+      var tl = tr;
+      tl = tl.replace(/\$\$([^$]*?)\$\$/g, function (m, inner) {
+        return String(inner || '').replace(/\s+/g, ' ').trim();
+      });
+      tl = tl.replace(/\$\$/g, '');
+      placeholders.push(tl);
+    } else {
+      outLines.push(raw);
+    }
+  }
+  s = outLines.join('\n');
+  s = s.replace(/\$\$([\s\S]*?)\$\$/g, function (m, inner) {
+    return String(inner || '')
+      .replace(/\r\n/g, '\n')
+      .replace(/\s+/g, ' ')
+      .trim();
+  });
+  s = s.replace(/^\s*\$\$\s*$/gm, '');
+  s = s.replace(/\$\$/g, '');
+  for (var pi = 0; pi < placeholders.length; pi++) {
+    s = s.split('__SG_TABLELINE_' + pi + '__').join(placeholders[pi]);
+  }
+  return s;
+}
+
+function _isSkippableGapBeforeHeadings(text) {
+  var t = String(text || '')
+    .replace(/\$C/gi, '')
+    .trim();
+  if (!t) return true;
+  if (t.length > 400) return false;
+  if (/^\|/.test(t) && /\|$/.test(t)) return false;
+  if (/^#{1,6}/.test(t)) return false;
+  if (t.length < 8) return true;
+  if (t.split(/\s+/).length > 35) return false;
+  if (t.length > 120 && /[.!?]["'\]]*\s*$/.test(t)) return false;
+  return true;
+}
+
+function _getPrevForHeadingLayout(blocks, idx) {
+  for (var j = idx - 1; j >= 0; j--) {
+    var b = blocks[j];
+    if (b && b.type === 'PARA' && _isSkippableGapBeforeHeadings(b.text)) continue;
+    return b;
+  }
+  return null;
+}
+
+function _getNextForHeadingLayout(blocks, idx) {
+  for (var j = idx + 1; j < blocks.length; j++) {
+    var b = blocks[j];
+    if (b && b.type === 'PARA' && _isSkippableGapBeforeHeadings(b.text)) continue;
+    return b;
+  }
+  return null;
+}
+
+function _parseBlocks(text) {
+  var lines = text.split('\n');
+  var blocks = [];
+  var seenQuestionNos = {};
+  var canMergePara = false;
+
+  for (var i = 0; i < lines.length; i++) {
+    var raw = lines[i];
+    var t = String(raw || '').trim();
+    // Metadata lines from generator should never render in Doc output.
+    if (/^Type\s*:/i.test(t)) continue;
+    if (/^Table\s*:\s*$/i.test(t)) continue;
+    if (!t) {
+      // Blank line explicitly breaks paragraph merge chain.
+      canMergePara = false;
+      continue;
+    }
+
+    if (_isQuestionLine(t) || _isLikelyNumberedQuestionLine(lines, i)) {
+      var q = { type: 'QUESTION', q: t, options: [], ans: '', exp: '' };
+      i++;
+      while (i < lines.length) {
+        var optRaw = String(lines[i] || '');
+        var optTrim = optRaw.trim();
+        if (!optTrim) {
+          i++;
+          continue;
+        }
+        if (_isOptionLine(optTrim)) {
+          var optionParts = [optTrim];
+          i++;
+          while (i < lines.length) {
+            var contRaw = String(lines[i] || '');
+            var contTrim = contRaw.trim();
+            if (!contTrim) { i++; continue; }
+            if (_isOptionLine(contTrim) || _isAnswerLine(contTrim) || _isExplanationLine(contTrim) || _isHardBlockStart(contTrim)) break;
+            if (_isOptionPointLine(contTrim) || _isOptionContinuationLine(contRaw, contTrim)) {
+              optionParts.push(contTrim);
+              i++;
+              continue;
+            }
+            break;
+          }
+          q.options.push(optionParts.join('\n').replace(/\n{3,}/g, '\n\n').trim());
+          continue;
+        }
+        break;
+      }
+      if (i < lines.length && _isAnswerLine(String(lines[i] || '').trim())) {
+        q.ans = String(lines[i] || '').trim();
+        i++;
+      }
+      if (i < lines.length && _isExplanationLine(String(lines[i] || '').trim())) {
+        var expParts = [String(lines[i] || '').trim()];
+        i++;
+        while (i < lines.length) {
+          var nx = String(lines[i] || '').trim();
+          if (!nx || _isHardBlockStart(nx) || _isOptionLine(nx)) break;
+          expParts.push(nx);
+          i++;
+        }
+        q.exp = expParts.join('\n');
+      }
+      q.options = _stabilizeOptionsInSourceOrder(q.options);
+      var qNo = _extractQuestionNumber(q.q);
+      if (qNo) {
+        if (seenQuestionNos[qNo]) {
+          i--;
+          continue; // avoid duplicate question render for same question number
+        }
+        seenQuestionNos[qNo] = true;
+      }
+      i--;
+      blocks.push(q);
+      canMergePara = false;
+      continue;
+    }
+
+    if (_isFreeResponseQuestionLine(t)) {
+      var fr = { type: 'FREE_RESPONSE', q: t, category: '', framework: '', rationale: '' };
+      i++;
+      while (i < lines.length) {
+        var frRaw = String(lines[i] || '');
+        var frTrim = frRaw.trim();
+        if (!frTrim) { i++; continue; }
+        if (_isFreeResponseQuestionLine(frTrim) || _isHardBlockStart(frTrim)) break;
+        if (/^Category\s*:/i.test(frTrim)) {
+          fr.category = frTrim.replace(/^Category\s*:\s*/i, '').trim();
+          i++;
+          continue;
+        }
+        if (/^Answer\s*Framework\s*:/i.test(frTrim)) {
+          fr.framework = frTrim.replace(/^Answer\s*Framework\s*:\s*/i, '').trim();
+          i++;
+          continue;
+        }
+        if (/^Rationale\s*:/i.test(frTrim)) {
+          fr.rationale = frTrim.replace(/^Rationale\s*:\s*/i, '').trim();
+          i++;
+          continue;
+        }
+        // Plain continuation fallback so FRQ body is never dropped.
+        if (!fr.framework) fr.framework = frTrim;
+        else if (!fr.rationale) fr.rationale = frTrim;
+        else fr.rationale += ' ' + frTrim;
+        i++;
+      }
+      i--;
+      blocks.push(fr);
+      canMergePara = false;
+      continue;
+    }
+
+    if (_isTableLine(t)) {
+      var rows = [];
+      while (i < lines.length) {
+        var traw = String(lines[i] || '');
+        var ttrim = traw.trim();
+        if (!ttrim) {
+          i++;
+          continue;
+        }
+        if (!_isTableLine(ttrim)) break;
+        if (!_isTableSeparator(ttrim)) rows.push(ttrim);
+        i++;
+      }
+      i--;
+      if (rows.length) blocks.push({ type: 'TABLE', rows: rows });
+      canMergePara = false;
+      continue;
+    }
+
+    if (/^\[FIGURE:\s*/i.test(t)) {
+      var figTitle = t.replace(/^\[FIGURE:\s*/i, '').replace(/\]\s*$/i, '').trim();
+      var figDesc = [];
+      i++;
+      while (i < lines.length && !/^\[\/FIGURE\]\s*$/i.test(String(lines[i] || '').trim())) {
+        var d = String(lines[i] || '').trim();
+        if (d) figDesc.push(d);
+        i++;
+      }
+      blocks.push({ type: 'FIGURE', title: figTitle, desc: figDesc.join(' ') });
+      canMergePara = false;
+      continue;
+    }
+
+    var phMatch = t.match(/^\d+\.\s*\[IMAGE PLACEHOLDER\s*[—-]\s*(.+?)\]\s*$/i) ||
+                  t.match(/^\[IMAGE PLACEHOLDER\s*[—-]\s*(.+?)\]\s*$/i);
+    if (phMatch) {
+      var phTitle = String(phMatch[1] || '').trim();
+      var promptLines = [];
+      var inlinePrompt = '';
+      var inlineMatch = phTitle.match(/^(.*?)\s+[—-]\s*PROMPT\s*:\s*([\s\S]+)$/i);
+      if (inlineMatch) {
+        phTitle = String(inlineMatch[1] || '').trim();
+        inlinePrompt = String(inlineMatch[2] || '').trim();
+      }
+      // If prompt is already inline, do not consume following assessment lines.
+      if (!inlinePrompt) {
+        i++;
+        while (i < lines.length) {
+          var plRaw = String(lines[i] || '');
+          var pl = plRaw.trim();
+          if (!pl) { i++; continue; }
+          if (/^\d+\.\s*\[IMAGE PLACEHOLDER\s*[—-]/i.test(pl) || /^\[IMAGE PLACEHOLDER\s*[—-]/i.test(pl)) break;
+          if (_isHardBlockStart(pl) || _isAnswerLine(pl) || _isExplanationLine(pl) || _isOptionLine(pl)) break;
+          promptLines.push(plRaw);
+          i++;
+        }
+        i--;
+      }
+      var legacy = promptLines.join('\n').trim();
+      if (/^PROMPT\s*\n/i.test(legacy) || /^PROMPT\s*:/i.test(legacy)) {
+        legacy = legacy.replace(/^PROMPT\s*\n+/i, '').replace(/^PROMPT\s*:?\s*/i, '').trim();
+      }
+      var finalPrompt = inlinePrompt || legacy;
+      blocks.push({ type: 'IMAGE_PLACEHOLDER', title: phTitle, prompt: finalPrompt });
+      canMergePara = false;
+      continue;
+    }
+
+    if (/^!\[[^\]]*\]\(([^)]+)\)/.test(t)) {
+      var mImg = t.match(/^!\[([^\]]*)\]\(([^)]+)\)/);
+      blocks.push({
+        type: 'INLINE_IMAGE',
+        alt: mImg ? String(mImg[1] || '').trim() : '',
+        src: mImg ? String(mImg[2] || '').trim() : ''
+      });
+      canMergePara = false;
+      continue;
+    }
+
+    if (/^#[^#]/.test(t)) {
+      blocks.push({ type: 'H1', text: t.replace(/^#\s*/, '').trim() });
+      canMergePara = false;
+      continue;
+    }
+    if (/^##[^#]/.test(t)) {
+      blocks.push({ type: 'H2', text: t.replace(/^##\s*/, '').trim() });
+      canMergePara = false;
+      continue;
+    }
+    if (/^###/.test(t)) {
+      blocks.push({ type: 'H3', text: t.replace(/^###\s*/, '').trim() });
+      canMergePara = false;
+      continue;
+    }
+
+    // Merge consecutive prose lines into a single paragraph block so wrapped
+    // lines from GPT don't become one-line broken paragraphs in Docs.
+    var last = blocks.length ? blocks[blocks.length - 1] : null;
+    if (canMergePara && last && last.type === 'PARA') {
+      var baseTrim = String(last.text || '').trim();
+      var addTrim = String(t || '').trim();
+      var joined;
+      // Join hyphen-split words from hard line wraps (e.g. "exam-" + "ple" -> "example")
+      if (/[A-Za-z]-\s*$/.test(baseTrim)) {
+        joined = baseTrim.replace(/-\s*$/, '') + addTrim;
+      } else if (/\u00AD\s*$/.test(baseTrim)) {
+        joined = baseTrim.replace(/\u00AD\s*$/, '') + addTrim;
+      } else {
+        joined = baseTrim + ' ' + addTrim;
+      }
+      last.text = joined.replace(/\s+/g, ' ').trim();
+    } else {
+      blocks.push({ type: 'PARA', text: t });
+    }
+    canMergePara = true;
+  }
+
+  return blocks;
+}
+
+function _renderBlock(body, block, section, prev, next, ctx, blocks, blockIndex) {
+  if (!block) return;
+  if (block.type === 'H1') return _renderH1(body, block.text, prev, next, blocks, blockIndex);
+  if (block.type === 'H2') return _renderH2(body, block.text, prev, next, blocks, blockIndex);
+  if (block.type === 'H3') return _renderH3(body, block.text, prev, next, ctx);
+  if (block.type === 'QUESTION') return _renderQuestion(body, block);
+  if (block.type === 'FREE_RESPONSE') return _renderFreeResponseQuestion(body, block);
+  if (block.type === 'TABLE') return _renderTable(body, block.rows);
+  if (block.type === 'FIGURE') return _renderFigureBlock(body, block.title, block.desc);
+  if (block.type === 'IMAGE_PLACEHOLDER') return _renderPromptPlaceholderFrame(body, block.title, block.prompt);
+  if (block.type === 'INLINE_IMAGE') return _renderInlineImage(body, block);
+  if (block.type === 'PARA') return _renderPara(body, block.text);
+}
+
+function _renderFreeResponseQuestion(body, fr) {
+  var qText = _cleanInlineMarkers(fr && fr.q ? fr.q : '');
+  qText = _ensureDisplayMathDelimiters(qText);
+  var qLine = body.appendParagraph('');
+  qLine.setHeading(DocumentApp.ParagraphHeading.NORMAL);
+  qLine.setFontFamily(FONT_FAMILY);
+  qLine.setFontSize(SIZE_H3);
+  qLine.setLineSpacing(LINE_SPACING);
+  qLine.setBold(true);
+  qLine.setSpacingBefore(SPACE_BEFORE_CONTENT);
+  qLine.setSpacingAfter(SPACE_AFTER_CONTENT);
+  _appendStyledRun(qLine, _stripMdBoldMarkers(qText), SIZE_H3, true);
+  _clearUnderlineInParagraph(qLine);
+
+  var cat = String(fr && fr.category ? fr.category : '').trim();
+  if (cat) {
+    var cp = body.appendParagraph('');
+    cp.setHeading(DocumentApp.ParagraphHeading.NORMAL);
+    cp.setFontFamily(FONT_FAMILY);
+    cp.setFontSize(SIZE_BODY);
+    cp.setLineSpacing(LINE_SPACING);
+    cp.setBold(false);
+    cp.setSpacingBefore(SPACE_BEFORE_CONTENT);
+    cp.setSpacingAfter(SPACE_AFTER_CONTENT);
+    _appendStyledRun(cp, 'Category: ', SIZE_BODY, true);
+    _appendStyledRun(cp, _stripMdBoldMarkers(cat), SIZE_BODY, false);
+    _clearUnderlineInParagraph(cp);
+  }
+
+  var framework = String(fr && fr.framework ? fr.framework : '').trim();
+  if (framework) {
+    var fp = body.appendParagraph('');
+    fp.setHeading(DocumentApp.ParagraphHeading.NORMAL);
+    fp.setFontFamily(FONT_FAMILY);
+    fp.setFontSize(SIZE_BODY);
+    fp.setLineSpacing(LINE_SPACING);
+    fp.setBold(false);
+    fp.setSpacingBefore(SPACE_BEFORE_CONTENT);
+    fp.setSpacingAfter(SPACE_AFTER_CONTENT);
+    _appendStyledRun(fp, 'Answer Framework: ', SIZE_BODY, true);
+    _appendStyledRun(fp, _stripMdBoldMarkers(framework), SIZE_BODY, false);
+    _clearUnderlineInParagraph(fp);
+  }
+
+  var rationale = String(fr && fr.rationale ? fr.rationale : '').trim();
+  if (rationale) {
+    var rp = body.appendParagraph('');
+    rp.setHeading(DocumentApp.ParagraphHeading.NORMAL);
+    rp.setFontFamily(FONT_FAMILY);
+    rp.setFontSize(SIZE_BODY);
+    rp.setLineSpacing(LINE_SPACING);
+    rp.setBold(false);
+    rp.setSpacingBefore(SPACE_BEFORE_CONTENT);
+    rp.setSpacingAfter(SPACE_AFTER_CONTENT);
+    _appendStyledRun(rp, 'Rationale: ', SIZE_BODY, true);
+    _appendStyledRun(rp, _stripMdBoldMarkers(rationale), SIZE_BODY, false);
+    _clearUnderlineInParagraph(rp);
+  }
+}
+
+function _renderH1(body, text, prev, next, blocks, blockIndex) {
+  var clean = String(text || '').trim();
+  if (!clean) return;
+  if (_isDisclaimerTitle(clean)) {
+    _renderDisclaimerLabel(body, clean);
+    return;
+  }
+
+  var ep = prev;
+  if (blocks && typeof blockIndex === 'number' && blockIndex >= 0) {
+    ep = _getPrevForHeadingLayout(blocks, blockIndex);
+  }
+
+  var lower = clean.toLowerCase();
+  var isFront = FRONT_H1_TITLES.indexOf(lower) !== -1;
+  var isDomain = _isDomainTitle(clean);
+  var isOverview = _isOverviewTitle(clean);
+  var shouldStartNewPage = false;
+
+  if (isFront || isDomain) {
+    shouldStartNewPage = true;
+  } else if (isOverview) {
+    // Exception: keep #Overview on the same page when it follows
+    // #Domain (with or without ##Subdomain in between).
+    var prevIsSub = !!(ep && ep.type === 'H2' && _isSubdomainTitle(ep.text));
+    var prevIsDomain = !!(ep && ep.type === 'H1' && _isDomainTitle(ep.text));
+    shouldStartNewPage = !(prevIsSub || prevIsDomain);
+  } else {
+    // All other single-# phases start on a new page.
+    shouldStartNewPage = true;
+  }
+
+  if (shouldStartNewPage) {
+    if (_bodyHasVisibleText(body)) body.appendPageBreak();
+  }
+
+  if (isFront) {
+    var fp = body.appendParagraph(clean);
+    fp.setHeading(DocumentApp.ParagraphHeading.HEADING1); // keep navigation
+    fp.setFontFamily(FONT_FAMILY);
+    fp.setFontSize(SIZE_H1);
+    fp.setBold(true);
+    fp.setUnderline(true); // text-length underline bar under centered front heading
+    fp.setAlignment(DocumentApp.HorizontalAlignment.CENTER);
+    fp.setSpacingBefore(2);
+    fp.setSpacingAfter(0);
+    return;
+  }
+
+  if (isDomain) {
+    _renderDomainBanner(body, clean);
+    return;
+  }
+
+  var p = body.appendParagraph(clean);
+  p.setHeading(DocumentApp.ParagraphHeading.HEADING1);
+  p.setFontFamily(FONT_FAMILY);
+  p.setFontSize(SIZE_H1);
+  p.setBold(true);
+  p.setSpacingBefore(2);
+  p.setSpacingAfter(0);
+  _clearUnderlineInParagraph(p);
+}
+
+function _renderH2(body, text, prev, next, blocks, blockIndex) {
+  if (_isDisclaimerTitle(text)) {
+    _renderDisclaimerLabel(body, text);
+    return;
+  }
+  var ep = prev;
+  var en = next;
+  if (blocks && typeof blockIndex === 'number' && blockIndex >= 0) {
+    ep = _getPrevForHeadingLayout(blocks, blockIndex);
+    en = _getNextForHeadingLayout(blocks, blockIndex);
+  }
+
+  var isSub = _isSubdomainTitle(text);
+  var inDomainOverviewCombo = false;
+  if (isSub) {
+    var prevIsDomain = !!(ep && ep.type === 'H1' && _isDomainTitle(ep.text));
+    var nextIsOverview = !!(en && en.type === 'H1' && _isOverviewTitle(en.text));
+    inDomainOverviewCombo = prevIsDomain && nextIsOverview;
+  }
+
+  // Keep #Domain + ##Subdomain on the same page (skip small gap PARAs e.g. after $$ cleanup).
+  var prevIsDomainOnly = !!(ep && ep.type === 'H1' && _isDomainTitle(ep.text));
+  if (isSub && !inDomainOverviewCombo && !prevIsDomainOnly) {
+    if (_bodyHasVisibleText(body)) body.appendPageBreak();
+  }
+
+  var converted = _convertSubdomainLabel(text);
+  if (isSub) {
+    _renderSubdomainBanner(body, converted);
+    return;
+  }
+  var p = body.appendParagraph(converted);
+  p.setHeading(DocumentApp.ParagraphHeading.HEADING2);
+  p.setFontFamily(FONT_FAMILY);
+  p.setFontSize(SIZE_H2);
+  p.setBold(true);
+  p.setSpacingBefore(2);
+  p.setSpacingAfter(0);
+  _clearUnderlineInParagraph(p);
+}
+
+function _renderH3(body, text, prev, next, ctx) {
+  if (_isDisclaimerTitle(text)) {
+    _renderDisclaimerLabel(body, text);
+    return;
+  }
+  if (_isPracticeHeading(text)) {
+    _renderPracticeHeadingOnce(body, ctx && ctx.docId ? ctx.docId : '');
+    return;
+  }
+
+  var p = body.appendParagraph(String(text || '').trim());
+  p.setHeading(DocumentApp.ParagraphHeading.HEADING3);
+  p.setFontFamily(FONT_FAMILY);
+  p.setFontSize(SIZE_H3);
+  p.setBold(true);
+  p.setForegroundColor('#000000');
+  p.setSpacingBefore(2);
+  p.setSpacingAfter(0);
+  _clearUnderlineInParagraph(p);
+}
+
+function _practiceHeadingKey(docId) {
+  return 'sg_practice_heading_' + String(docId || '').trim();
+}
+
+function _renderPracticeHeadingOnce(body, docId) {
+  var key = _practiceHeadingKey(docId);
+  if (docId && SCRIPT_PROPS.getProperty(key) === '1') return;
+
+  if (_bodyHasVisibleText(body)) body.appendPageBreak();
+  var p = body.appendParagraph('Practice Questions');
+  p.setHeading(DocumentApp.ParagraphHeading.HEADING3);
+  p.setFontFamily(FONT_FAMILY);
+  p.setFontSize(SIZE_H3);
+  p.setBold(true);
+  p.setForegroundColor('#000000');
+  p.setSpacingBefore(2);
+  p.setSpacingAfter(0);
+  _clearUnderlineInParagraph(p);
+
+  if (docId) SCRIPT_PROPS.setProperty(key, '1');
+}
+
+function _renderPara(body, text) {
+  var clean = _cleanInlineMarkers(text);
+  clean = _ensureDisplayMathDelimiters(clean);
+  clean = _wrapEquationForNarrowColumn(clean, _isNarrowColumnContainer(body));
+  if (!clean) return;
+  if (_isDisplayMathParagraph(clean)) {
+    _renderDisplayMathParagraph(body, clean);
+    return;
+  }
+  var plain = _stripMdBoldMarkers(clean).trim();
+  var wordCount = plain ? plain.split(/\s+/).filter(Boolean).length : 0;
+  var looksProse = /[.!?]["')\]]*$/.test(plain) || wordCount >= 18;
+  var isHeadingLikeLine =
+    /^(\*\*[^*]+\*\*|[A-Z][A-Z0-9 \-:]{2,60})$/.test(String(clean || '').trim()) ||
+    /^(disclaimer|note|warning|important)\s*:?\s*$/i.test(plain);
+  var isNonProseLine =
+    /^\([A-Z]\)\s+/.test(plain) ||
+    /^Q\d+[\.\)]/i.test(plain) ||
+    /^Answer\s*:/i.test(plain) ||
+    /^Expla?nation\s*:/i.test(plain) ||
+    /^\$?\$/.test(plain) ||
+    /^[-*]\s+/.test(plain);
+  if (_isDisclaimerTitle(plain)) {
+    _renderDisclaimerLabel(body, plain);
+    return;
+  }
+
+  var p = body.appendParagraph('');
+  p.setHeading(DocumentApp.ParagraphHeading.NORMAL);
+  p.setFontFamily(FONT_FAMILY);
+  p.setFontSize(SIZE_BODY);
+  p.setLineSpacing(LINE_SPACING);
+  p.setBold(false);
+  var shouldJustify = !isHeadingLikeLine && !isNonProseLine && looksProse;
+  p.setAlignment(shouldJustify ? DocumentApp.HorizontalAlignment.JUSTIFY : DocumentApp.HorizontalAlignment.LEFT);
+  p.setSpacingBefore(SPACE_BEFORE_CONTENT);
+  p.setSpacingAfter(SPACE_AFTER_CONTENT);
+  _appendMarkdownBoldRuns(p, clean, SIZE_BODY, false);
+  _clearUnderlineInParagraph(p);
+}
+
+function _isDisplayMathParagraph(text) {
+  var t = String(text || '').trim();
+  return /^\$\$[\s\S]*\$\$$/.test(t);
+}
+
+/**
+ * Render DISPLAY math/reaction lines in a dedicated equation-like style.
+ * Keeps source expression text exact (no semantic rewriting), similar to
+ * LaTeX display-block visual behavior inside Google Docs text flow.
+ */
+function _renderDisplayMathParagraph(body, text) {
+  var raw = String(text || '').trim();
+  var expr = raw.replace(/^\$\$\s*/, '').replace(/\s*\$\$$/, '').trim();
+  if (!expr) return;
+
+  // 1) Normalize existing newlines.
+  // 2) Force split before "=" so long identities/formulas become readable line blocks.
+  //    Example: "a+b = c+d = e" -> "a+b" "\n= c+d" "\n= e"
+  expr = expr.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  var chunks = expr.split('\n').map(function (x) { return String(x || '').trim(); }).filter(function (x) { return !!x; });
+  if (!chunks.length) chunks = [expr];
+
+  var lines = [];
+  for (var ci = 0; ci < chunks.length; ci++) {
+    var line = String(chunks[ci] || '').trim();
+    if (!line) continue;
+    // Break before every "=" (except if "=" is first token already).
+    var broken = line.replace(/\s*=\s*/g, '\n= ');
+    var parts = broken.split('\n');
+    for (var pi = 0; pi < parts.length; pi++) {
+      var p = String(parts[pi] || '').trim();
+      if (!p) continue;
+      lines.push(p);
+    }
+  }
+  if (!lines.length) lines = [expr];
+
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    // Ensure each rendered equation line is wrapped exactly as requested.
+    var displayLine = '$$ ' + line + ' $$';
+    var p = body.appendParagraph('');
+    p.setHeading(DocumentApp.ParagraphHeading.NORMAL);
+    p.setFontFamily('Cambria Math');
+    p.setFontSize(12);
+    p.setLineSpacing(1.05);
+    p.setBold(false);
+    p.setAlignment(DocumentApp.HorizontalAlignment.CENTER);
+    p.setSpacingBefore(2);
+    p.setSpacingAfter(2);
+    _appendStyledRun(p, _stripMdBoldMarkers(displayLine), 12, false);
+    _clearUnderlineInParagraph(p);
+  }
+}
+
+function _isDisclaimerTitle(text) {
+  var t = String(text || '')
+    .replace(/^#{1,6}\s*/, '')
+    .replace(/\*\*/g, '')
+    .replace(/[:\-\s]+$/g, '')
+    .trim()
+    .toLowerCase();
+  return t === 'disclaimer';
+}
+
+function _renderDisclaimerLabel(body, text) {
+  var p = body.appendParagraph(String(text || '').replace(/^#{1,6}\s*/, '').replace(/\*\*/g, '').trim() || 'DISCLAIMER');
+  p.setHeading(DocumentApp.ParagraphHeading.NORMAL); // never appear in navigation
+  p.setFontFamily('Calibri');
+  p.setFontSize(12);
+  p.setBold(true);
+  p.setLineSpacing(LINE_SPACING);
+  p.setAlignment(DocumentApp.HorizontalAlignment.LEFT);
+  p.setSpacingBefore(SPACE_BEFORE_CONTENT);
+  p.setSpacingAfter(SPACE_AFTER_CONTENT);
+  _clearUnderlineInParagraph(p);
+}
+
+function _renderQuestion(body, q) {
+  var inNarrowColumn = _isNarrowColumnContainer(body);
+  var qText = _cleanInlineMarkers(q.q);
+  qText = _ensureDisplayMathDelimiters(qText);
+  qText = _wrapEquationForNarrowColumn(qText, inNarrowColumn);
+  var qLine = body.appendParagraph('');
+  qLine.setHeading(DocumentApp.ParagraphHeading.NORMAL);
+  qLine.setFontFamily(FONT_FAMILY);
+  qLine.setFontSize(SIZE_H3);
+  qLine.setLineSpacing(LINE_SPACING);
+  qLine.setBold(true);
+  qLine.setSpacingBefore(SPACE_BEFORE_CONTENT);
+  qLine.setSpacingAfter(SPACE_AFTER_CONTENT);
+  _appendStyledRun(qLine, _stripMdBoldMarkers(qText), SIZE_H3, true);
+  _clearUnderlineInParagraph(qLine);
+
+  for (var i = 0; i < (q.options || []).length; i++) {
+    var opText = _cleanInlineMarkers(q.options[i]);
+    opText = _ensureDisplayMathDelimiters(opText);
+    opText = _wrapEquationForNarrowColumn(opText, inNarrowColumn);
+    if (!opText) continue;
+    var opLines = String(opText).split('\n').map(function (x) { return String(x || '').trim(); }).filter(function (x) { return !!x; });
+    if (!opLines.length) continue;
+
+    var op = body.appendParagraph('');
+    op.setHeading(DocumentApp.ParagraphHeading.NORMAL);
+    op.setFontFamily(FONT_FAMILY);
+    op.setFontSize(SIZE_BODY);
+    op.setLineSpacing(LINE_SPACING);
+    op.setBold(false);
+    op.setSpacingBefore(SPACE_BEFORE_CONTENT);
+    op.setSpacingAfter(SPACE_AFTER_CONTENT);
+    _appendStyledRun(op, _stripMdBoldMarkers(opLines[0]), SIZE_BODY, false);
+    _clearUnderlineInParagraph(op);
+
+    for (var oi = 1; oi < opLines.length; oi++) {
+      var sub = body.appendParagraph('');
+      sub.setHeading(DocumentApp.ParagraphHeading.NORMAL);
+      sub.setFontFamily(FONT_FAMILY);
+      sub.setFontSize(SIZE_BODY);
+      sub.setLineSpacing(LINE_SPACING);
+      sub.setBold(false);
+      sub.setSpacingBefore(0);
+      sub.setSpacingAfter(SPACE_AFTER_CONTENT);
+      _appendStyledRun(sub, _stripMdBoldMarkers(opLines[oi]), SIZE_BODY, false);
+      _clearUnderlineInParagraph(sub);
+    }
+  }
+
+  if (q.ans) {
+    var ansText = _cleanInlineMarkers(q.ans);
+    ansText = _ensureDisplayMathDelimiters(ansText);
+    ansText = _wrapEquationForNarrowColumn(ansText, inNarrowColumn);
+    var ans = body.appendParagraph('');
+    ans.setHeading(DocumentApp.ParagraphHeading.NORMAL);
+    ans.setFontFamily(FONT_FAMILY);
+    ans.setFontSize(SIZE_H3);
+    ans.setLineSpacing(LINE_SPACING);
+    ans.setBold(true);
+    ans.setSpacingBefore(SPACE_BEFORE_CONTENT);
+    ans.setSpacingAfter(SPACE_AFTER_CONTENT);
+    _appendStyledRun(ans, _stripMdBoldMarkers(ansText), SIZE_H3, true);
+    _clearUnderlineInParagraph(ans);
+  }
+
+  if (q.exp) {
+    var expText = _cleanInlineMarkers(q.exp);
+    var idx = expText.indexOf(':');
+    var label = idx >= 0 ? expText.substring(0, idx + 1) : 'Explanation:';
+    var rest = idx >= 0 ? expText.substring(idx + 1).trim() : '';
+    rest = _ensureDisplayMathDelimiters(rest);
+    rest = _wrapEquationForNarrowColumn(rest, inNarrowColumn);
+    var restLines = [];
+    var rj;
+    var rawParts = String(rest || '').split('\n');
+    for (rj = 0; rj < rawParts.length; rj++) {
+      var px = String(rawParts[rj] || '').trim();
+      if (px) restLines.push(px);
+    }
+
+    var ep = body.appendParagraph('');
+    ep.setHeading(DocumentApp.ParagraphHeading.NORMAL);
+    ep.setFontFamily(FONT_FAMILY);
+    ep.setLineSpacing(LINE_SPACING);
+    ep.setSpacingBefore(SPACE_BEFORE_CONTENT);
+    ep.setSpacingAfter(SPACE_AFTER_CONTENT);
+
+    var run1 = ep.appendText(_stripMdBoldMarkers(label + (restLines.length ? ' ' : '')));
+    run1.setFontFamily(FONT_FAMILY);
+    run1.setFontSize(SIZE_H3);
+    run1.setBold(true);
+    try {
+      var r1l = run1.getText().length;
+      if (r1l > 0) run1.setUnderline(0, r1l - 1, false);
+    } catch (e0) {}
+
+    if (restLines.length) {
+      _appendStyledRun(ep, _stripMdBoldMarkers(restLines[0]), SIZE_BODY, false);
+    }
+    _clearUnderlineInParagraph(ep);
+
+    for (rj = 1; rj < restLines.length; rj++) {
+      var rp = body.appendParagraph('');
+      rp.setHeading(DocumentApp.ParagraphHeading.NORMAL);
+      rp.setFontFamily(FONT_FAMILY);
+      rp.setFontSize(SIZE_BODY);
+      rp.setLineSpacing(LINE_SPACING);
+      rp.setBold(false);
+      rp.setSpacingBefore(0);
+      rp.setSpacingAfter(SPACE_AFTER_CONTENT);
+      _appendStyledRun(rp, _stripMdBoldMarkers(restLines[rj]), SIZE_BODY, false);
+      _clearUnderlineInParagraph(rp);
+    }
+  }
+}
+
+function _stripMdBoldMarkers(text) {
+  return String(text || '').replace(/\*\*(.*?)\*\*/g, '$1');
+}
+
+function _appendMarkdownBoldRuns(paragraph, text, normalSize, defaultBold) {
+  var src = String(text || '');
+  if (!src) return;
+
+  var re = /\*\*(.+?)\*\*/g;
+  var last = 0;
+  var m;
+
+  while ((m = re.exec(src)) !== null) {
+    var before = src.substring(last, m.index);
+    if (before) _appendStyledRun(paragraph, before, normalSize, defaultBold);
+    _appendStyledRun(paragraph, m[1], SIZE_INLINE_BOLD, true);
+    last = re.lastIndex;
+  }
+
+  var tail = src.substring(last);
+  if (tail) _appendStyledRun(paragraph, tail, normalSize, defaultBold);
+}
+
+function _appendStyledRun(paragraph, text, size, isBold) {
+  var s = String(text || '');
+  if (!s) return;
+  var run = paragraph.appendText(s);
+  run.setFontFamily(FONT_FAMILY);
+  run.setFontSize(size);
+  run.setBold(!!isBold);
+  try {
+    run.setUnderline(0, s.length - 1, false);
+  } catch (e) {}
+}
+
+/** Remove unwanted underline (often inherited) from all TEXT runs in a paragraph. */
+function _clearUnderlineInParagraph(p) {
+  if (!p) return;
+  try {
+    var n = p.getNumChildren();
+    for (var i = 0; i < n; i++) {
+      var ch = p.getChild(i);
+      if (ch.getType() === DocumentApp.ElementType.TEXT) {
+        var te = ch.asText();
+        var L = te.getText().length;
+        if (L > 0) te.setUnderline(0, L - 1, false);
+      }
+    }
+  } catch (e) {}
+}
+
+function _isNarrowColumnContainer(container) {
+  return false;
+}
+
+function _wrapEquationForNarrowColumn(text, inNarrowColumn) {
+  var t = String(text || '');
+  if (!inNarrowColumn) return t;
+  if (/^\s*\$\$[\s\S]*\$\$\s*$/.test(t)) return t;
+  if (t.indexOf('=') === -1) return t;
+  if (t.length < 65) return t;
+  return t.replace(/\s*=\s*/g, ' =\n');
+}
+
+function _ensureDisplayMathDelimiters(text) {
+  var t = String(text || '').trim();
+  if (!t) return t;
+  if (/^\s*\$\$[\s\S]*\$\$\s*$/.test(t)) return t;
+  if (!_looksLikeMathEquationLine(t)) return t;
+  return '$$ ' + t + ' $$';
+}
+
+function _looksLikeMathEquationLine(text) {
+  var t = String(text || '').trim();
+  if (!t) return false;
+  if (t.indexOf('=') === -1) return false;
+  if (/^q\s*\d+[\.\)]/i.test(t)) return false;
+  if (/^\([A-Z]\)\s+/.test(t)) return false;
+  if (/^answer\s*:/i.test(t) || /^expla?nation\s*:/i.test(t)) return false;
+  if (/[0-9]/.test(t) && /[A-Za-z]/.test(t) && /[+\-*/^()=]/.test(t)) return true;
+  if (/(sin|cos|tan|log|ln|sqrt|sigma|theta|alpha|beta|pi|integral|derivative)/i.test(t)) return true;
+  if (/^[A-Za-z0-9\s+\-*/^().=<>]+$/.test(t)) return true;
+  return false;
+}
+
+function _renderTable(body, rows) {
+  if (!rows || !rows.length) return;
+
+  var parsedRows = [];
+  var maxCols = 0;
+  for (var r = 0; r < rows.length; r++) {
+    var cols = _parseTableRow(rows[r]);
+    if (cols.length > maxCols) maxCols = cols.length;
+    parsedRows.push(cols);
+  }
+  if (!maxCols) return;
+
+  var table = body.appendTable();
+  for (var rr = 0; rr < parsedRows.length; rr++) {
+    var tr = table.appendTableRow();
+    var colsRow = parsedRows[rr];
+    for (var cc = 0; cc < maxCols; cc++) {
+      var txt = cc < colsRow.length ? colsRow[cc] : '';
+      var cell = tr.appendTableCell(String(txt || '').trim());
+      cell.setPaddingTop(2);
+      cell.setPaddingBottom(2);
+      cell.setPaddingLeft(6);
+      cell.setPaddingRight(6);
+      var p = cell.getChild(0).asParagraph();
+      p.setFontFamily(FONT_FAMILY);
+      p.setFontSize(SIZE_BODY);
+      p.setLineSpacing(LINE_SPACING);
+      p.setSpacingBefore(SPACE_BEFORE_CONTENT);
+      p.setSpacingAfter(SPACE_AFTER_CONTENT);
+      p.setBold(rr === 0);
+      _clearUnderlineInParagraph(p);
+    }
+  }
+
+  table.setBorderWidth(1);
+  var spacer = body.appendParagraph('');
+  spacer.setFontFamily(FONT_FAMILY);
+  spacer.setFontSize(1);
+  spacer.setSpacingBefore(SPACE_BEFORE_CONTENT);
+  spacer.setSpacingAfter(SPACE_AFTER_CONTENT);
+  _clearUnderlineInParagraph(spacer);
+}
+
+function _renderFigureBlock(body, title, desc) {
+  var t = String(title || 'Figure').trim();
+  var d = String(desc || '').trim();
+
+  var cap = body.appendParagraph('Figure: ' + t);
+  cap.setFontFamily(FONT_FAMILY);
+  cap.setFontSize(SIZE_H3);
+  cap.setLineSpacing(LINE_SPACING);
+  cap.setBold(true);
+  cap.setSpacingBefore(SPACE_BEFORE_CONTENT);
+  cap.setSpacingAfter(SPACE_AFTER_CONTENT);
+  _clearUnderlineInParagraph(cap);
+
+  if (d) {
+    var dp = body.appendParagraph(d);
+    dp.setFontFamily(FONT_FAMILY);
+    dp.setFontSize(SIZE_BODY);
+    dp.setLineSpacing(LINE_SPACING);
+    dp.setBold(false);
+    dp.setSpacingBefore(SPACE_BEFORE_CONTENT);
+    dp.setSpacingAfter(SPACE_AFTER_CONTENT);
+    _clearUnderlineInParagraph(dp);
+  }
+}
+
+function _renderInlineImage(body, imgBlock) {
+  var src = String((imgBlock && imgBlock.src) || '').trim();
+  if (!src) return;
+
+  try {
+    var resp = UrlFetchApp.fetch(src);
+    var blob = resp.getBlob();
+    var img = body.appendImage(blob);
+    _scaleImage(img, 520);
+  } catch (err) {
+    var fallback = body.appendParagraph('[Image load failed] ' + err.message);
+    fallback.setFontFamily(FONT_FAMILY);
+    fallback.setFontSize(SIZE_BODY);
+    fallback.setLineSpacing(LINE_SPACING);
+    fallback.setBold(false);
+    fallback.setSpacingBefore(SPACE_BEFORE_CONTENT);
+    fallback.setSpacingAfter(SPACE_AFTER_CONTENT);
+    _clearUnderlineInParagraph(fallback);
+  }
+
+  var alt = String((imgBlock && imgBlock.alt) || '').trim();
+  if (alt) {
+    var cap = body.appendParagraph(alt);
+    cap.setFontFamily(FONT_FAMILY);
+    cap.setFontSize(SIZE_BODY);
+    cap.setLineSpacing(LINE_SPACING);
+    cap.setBold(false);
+    cap.setSpacingBefore(SPACE_BEFORE_CONTENT);
+    cap.setSpacingAfter(SPACE_AFTER_CONTENT);
+    _clearUnderlineInParagraph(cap);
+  }
+}
+
+function appendImage(docId, payload) {
+  var doc = DocumentApp.openById(docId);
+  var body = doc.getBody();
+  var caption = String(payload.imageCaption || payload.section || 'Figure').trim();
+
+  if (payload.imageData && String(payload.imageData).indexOf('data:') === 0) {
+    var parts = String(payload.imageData).split(',');
+    if (parts.length === 2) {
+      var mimeMatch = parts[0].match(/data:([^;]+)/);
+      var mime = mimeMatch ? mimeMatch[1] : 'image/png';
+      var bytes = Utilities.base64Decode(parts[1]);
+      var blob = Utilities.newBlob(bytes, mime, 'image');
+      var img = body.appendImage(blob);
+      _scaleImage(img, 520);
+    }
+  } else if (payload.imageSrc) {
+    var resp = UrlFetchApp.fetch(String(payload.imageSrc));
+    var blob2 = resp.getBlob();
+    var img2 = body.appendImage(blob2);
+    _scaleImage(img2, 520);
+  } else {
+    _renderDefaultImagePlaceholder(body, caption);
+  }
+
+  if (caption) {
+    var cap = body.appendParagraph(caption);
+    cap.setFontFamily(FONT_FAMILY);
+    cap.setFontSize(SIZE_BODY);
+    cap.setLineSpacing(LINE_SPACING);
+    cap.setBold(false);
+    cap.setSpacingBefore(SPACE_BEFORE_CONTENT);
+    cap.setSpacingAfter(SPACE_AFTER_CONTENT);
+    _clearUnderlineInParagraph(cap);
+  }
+
+  doc.saveAndClose();
+}
+
+function _scaleImage(img, maxW) {
+  var w = img.getWidth();
+  if (w > maxW) {
+    var ratio = maxW / w;
+    img.setWidth(maxW);
+    img.setHeight(Math.round(img.getHeight() * ratio));
+  }
+}
+
+function _renderDefaultImagePlaceholder(body, caption) {
+  var table = body.appendTable([['']]);
+  table.setBorderWidth(1);
+  var cell = table.getRow(0).getCell(0);
+  try { cell.setWidth(520); } catch (_) {}
+  cell.setPaddingTop(120);
+  cell.setPaddingBottom(120);
+  cell.setPaddingLeft(12);
+  cell.setPaddingRight(12);
+  var p = cell.getChild(0).asParagraph();
+  p.setText('');
+  p.setFontFamily(FONT_FAMILY);
+  p.setFontSize(SIZE_BODY);
+  p.setLineSpacing(LINE_SPACING);
+  p.setAlignment(DocumentApp.HorizontalAlignment.CENTER);
+  _clearUnderlineInParagraph(p);
+
+  var mid = cell.appendParagraph('[IMAGE PLACEHOLDER]');
+  mid.setFontFamily(FONT_FAMILY);
+  mid.setFontSize(SIZE_H3);
+  mid.setBold(true);
+  mid.setLineSpacing(LINE_SPACING);
+  mid.setAlignment(DocumentApp.HorizontalAlignment.CENTER);
+  _clearUnderlineInParagraph(mid);
+
+  var cap = cell.appendParagraph(String(caption || '').trim());
+  cap.setFontFamily(FONT_FAMILY);
+  cap.setFontSize(SIZE_BODY);
+  cap.setBold(false);
+  cap.setLineSpacing(LINE_SPACING);
+  cap.setAlignment(DocumentApp.HorizontalAlignment.CENTER);
+  _clearUnderlineInParagraph(cap);
+
+  var bottom = cell.appendParagraph('');
+  bottom.setFontFamily(FONT_FAMILY);
+  bottom.setFontSize(1);
+  bottom.setSpacingBefore(0);
+  bottom.setSpacingAfter(0);
+  _clearUnderlineInParagraph(bottom);
+}
+
+function _renderPromptPlaceholderFrame(body, title, prompt) {
+  var capText = String(title || 'Figure').trim();
+  var promptText = String(prompt || '').trim();
+
+  var table = body.appendTable([['']]);
+  table.setBorderWidth(1);
+  var cell = table.getRow(0).getCell(0);
+  try { cell.setWidth(520); } catch (_) {}
+  cell.setPaddingTop(24);
+  cell.setPaddingBottom(24);
+  cell.setPaddingLeft(12);
+  cell.setPaddingRight(12);
+
+  var tag = cell.getChild(0).asParagraph();
+  tag.setText('[IMAGE PLACEHOLDER]');
+  tag.setFontFamily(FONT_FAMILY);
+  tag.setFontSize(SIZE_H3);
+  tag.setBold(true);
+  tag.setLineSpacing(LINE_SPACING);
+  tag.setAlignment(DocumentApp.HorizontalAlignment.CENTER);
+  _clearUnderlineInParagraph(tag);
+
+  if (capText) {
+    var cap = cell.appendParagraph(capText);
+    cap.setFontFamily(FONT_FAMILY);
+    cap.setFontSize(SIZE_BODY);
+    cap.setBold(false);
+    cap.setLineSpacing(LINE_SPACING);
+    cap.setAlignment(DocumentApp.HorizontalAlignment.CENTER);
+    _clearUnderlineInParagraph(cap);
+  }
+
+  if (promptText) {
+    var p = cell.appendParagraph(promptText);
+    p.setFontFamily(FONT_FAMILY);
+    p.setFontSize(SIZE_BODY);
+    p.setBold(false);
+    p.setLineSpacing(LINE_SPACING);
+    p.setAlignment(DocumentApp.HorizontalAlignment.LEFT);
+    _clearUnderlineInParagraph(p);
+  }
+
+  var spacer = body.appendParagraph('');
+  spacer.setFontFamily(FONT_FAMILY);
+  spacer.setFontSize(1);
+  spacer.setSpacingBefore(0);
+  spacer.setSpacingAfter(0);
+  _clearUnderlineInParagraph(spacer);
+}
+
+function _renderDomainBanner(body, domainText) {
+  var m = String(domainText || '').match(/^Domain-(\d+)\s*:\s*(.+)$/i);
+  var chapterNo = m ? String(m[1]) : '';
+  var chapterName = m ? String(m[2]).trim() : String(domainText || '').trim();
+  var unitWord = _numberToWord(chapterNo);
+
+  var top = body.appendParagraph('UNIT ' + unitWord + '    ' + chapterName.toUpperCase());
+  top.setHeading(DocumentApp.ParagraphHeading.HEADING1);
+  top.setFontFamily(FONT_FAMILY);
+  top.setFontSize(12);
+  top.setBold(true);
+  top.setAlignment(DocumentApp.HorizontalAlignment.RIGHT);
+  top.setLineSpacing(LINE_SPACING);
+  top.setSpacingBefore(2);
+  top.setSpacingAfter(0);
+  _clearUnderlineInParagraph(top);
+
+  var topLine = body.appendParagraph('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  topLine.setFontFamily(FONT_FAMILY);
+  topLine.setFontSize(6);
+  topLine.setBold(false);
+  topLine.setSpacingBefore(0);
+  topLine.setSpacingAfter(6);
+  _clearUnderlineInParagraph(topLine);
+
+  var badge = body.appendParagraph(String(chapterNo || '1'));
+  badge.setHeading(DocumentApp.ParagraphHeading.NORMAL);
+  badge.setFontFamily(FONT_FAMILY);
+  badge.setFontSize(20);
+  badge.setBold(true);
+  badge.setForegroundColor('#000000');
+  badge.setAlignment(DocumentApp.HorizontalAlignment.LEFT);
+  badge.setSpacingBefore(0);
+  badge.setSpacingAfter(0);
+  _clearUnderlineInParagraph(badge);
+
+  var rp = body.appendParagraph(chapterName);
+  rp.setHeading(DocumentApp.ParagraphHeading.NORMAL);
+  rp.setFontFamily(FONT_FAMILY);
+  rp.setFontSize(20);
+  rp.setBold(true);
+  rp.setAlignment(DocumentApp.HorizontalAlignment.LEFT);
+  rp.setSpacingBefore(0);
+  rp.setSpacingAfter(0);
+  _clearUnderlineInParagraph(rp);
+
+  var bottomLine = body.appendParagraph('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  bottomLine.setFontFamily(FONT_FAMILY);
+  bottomLine.setFontSize(6);
+  bottomLine.setBold(false);
+  bottomLine.setSpacingBefore(0);
+  bottomLine.setSpacingAfter(4);
+  _clearUnderlineInParagraph(bottomLine);
+}
+
+function _renderSubdomainBanner(body, subLabel) {
+  var m = String(subLabel || '').match(/^(\d+(?:\.\d+)*)\s+(.+)$/);
+  var num = m ? m[1] : '';
+  var title = m ? m[2] : String(subLabel || '');
+  var navText = (num ? (num + ' ' + title) : title).trim();
+
+  // Outline/nav anchor so subdomain headings appear in Google Docs navigation.
+  // Keep it visually minimal while still using a real heading paragraph.
+  var nav = body.appendParagraph(navText);
+  nav.setHeading(DocumentApp.ParagraphHeading.HEADING2);
+  nav.setFontFamily(FONT_FAMILY);
+  nav.setFontSize(1);
+  nav.setBold(false);
+  nav.setForegroundColor('#FFFFFF');
+  nav.setSpacingBefore(0);
+  nav.setSpacingAfter(0);
+  _clearUnderlineInParagraph(nav);
+
+  var tbl = body.appendTable();
+  tbl.setBorderWidth(0);
+  var row = tbl.appendTableRow();
+  var left = row.appendTableCell('');
+  var right = row.appendTableCell('');
+  if (tbl.getNumRows() > 1) tbl.removeRow(0);
+
+  left.setBackgroundColor('#111111');
+  left.setPaddingTop(4);
+  left.setPaddingBottom(4);
+  left.setPaddingLeft(8);
+  left.setPaddingRight(8);
+  try { left.setWidth(58); } catch (_) {}
+  var lp = left.getChild(0).asParagraph();
+  lp.setText(num || '');
+  lp.setHeading(DocumentApp.ParagraphHeading.NORMAL);
+  lp.setFontFamily(FONT_FAMILY);
+  lp.setFontSize(16);
+  lp.setBold(true);
+  lp.setForegroundColor('#FFFFFF');
+  lp.setAlignment(DocumentApp.HorizontalAlignment.CENTER);
+  lp.setSpacingBefore(0);
+  lp.setSpacingAfter(0);
+  _clearUnderlineInParagraph(lp);
+
+  right.setPaddingTop(6);
+  right.setPaddingBottom(2);
+  right.setPaddingLeft(8);
+  right.setPaddingRight(0);
+  var rp = right.getChild(0).asParagraph();
+  rp.setText(title);
+  rp.setHeading(DocumentApp.ParagraphHeading.HEADING2);
+  rp.setFontFamily(FONT_FAMILY);
+  rp.setFontSize(14);
+  rp.setBold(true);
+  rp.setForegroundColor('#000000');
+  rp.setAlignment(DocumentApp.HorizontalAlignment.LEFT);
+  rp.setSpacingBefore(0);
+  rp.setSpacingAfter(0);
+  _clearUnderlineInParagraph(rp);
+
+  var line = body.appendParagraph('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  line.setFontFamily(FONT_FAMILY);
+  line.setFontSize(6);
+  line.setBold(false);
+  line.setSpacingBefore(0);
+  line.setSpacingAfter(3);
+  _clearUnderlineInParagraph(line);
+}
+
+function _convertSubdomainLabel(text) {
+  var t = String(text || '').trim();
+  var m = t.match(/^Subdomain-(\d+\.\d+)\s*:\s*(.+)$/i);
+  if (m) return m[1] + ' ' + m[2].trim();
+
+  m = t.match(/^(\d+\.\d+)\s*:\s*(.+)$/);
+  if (m) return m[1] + ' ' + m[2].trim();
+
+  return t;
+}
+
+function _isQuestionLine(line) {
+  var s = String(line || '').trim();
+  if (!s) return false;
+
+  // Supports variants like:
+  // Q30, Q 30, Q.30, Q-30, Qno30, Q No. 30, Question 30, Q#30
+  // with or without immediate question text on same line.
+  return /^Q(?:uestion)?\s*(?:No\.?|#)?\s*[-.:]?\s*\d+\b/i.test(s);
+}
+
+function _isFreeResponseQuestionLine(line) {
+  var s = String(line || '').trim();
+  return /^FRQ\s*\d+[\.\):]/i.test(s);
+}
+
+function _isLikelyNumberedQuestionLine(lines, idx) {
+  var s = String((lines && lines[idx]) || '').trim();
+  if (!s) return false;
+
+  // Handles lines like: "30) ...", "30. ...", "(30) ...", "30 - ..."
+  if (!/^(?:\(\d+\)|\d+[\).:-])\s+/.test(s)) return false;
+
+  // Consider as question only when next non-empty line looks like option.
+  for (var i = idx + 1; i < lines.length; i++) {
+    var nx = String(lines[i] || '').trim();
+    if (!nx) continue;
+    return _isOptionLine(nx);
+  }
+  return false;
+}
+
+function _extractQuestionNumber(line) {
+  var s = String(line || '').trim();
+  if (!s) return '';
+
+  var m = s.match(/^Q(?:uestion)?\s*(?:No\.?|#)?\s*[-.:]?\s*(\d+)\b/i);
+  if (m) return m[1];
+
+  m = s.match(/^\(?(\d+)\)?[\).:-]\s+/);
+  if (m) return m[1];
+
+  return '';
+}
+
+function _isOptionLine(line) {
+  return /^\([A-Z]\)\s+/.test(line);
+}
+
+function _isOptionPointLine(line) {
+  var s = String(line || '').trim();
+  return /^\(\d+\)\s+/.test(s) || /^\([ivxlcdm]+\)\s+/i.test(s);
+}
+
+function _isOptionContinuationLine(rawLine, trimmedLine) {
+  var raw = String(rawLine || '');
+  var t = String(trimmedLine || '').trim();
+  if (!t) return false;
+  // Accept indented continuation lines and list-style detail lines under options.
+  if (/^\s{2,}\S+/.test(raw)) return true;
+  if (/^[-*]\s+/.test(t)) return true;
+  if (/^(detail|data|note|visual|table|figure)\s*[:\-]/i.test(t)) return true;
+  return false;
+}
+
+function _stabilizeOptionsInSourceOrder(options) {
+  var arr = Array.isArray(options) ? options.slice() : [];
+  if (!arr.length) return arr;
+
+  var normalized = [];
+  var seen = {};
+  for (var i = 0; i < arr.length; i++) {
+    var line = String(arr[i] || '').trim();
+    var m = line.match(/^\(([A-Z])\)\s+/);
+    if (!m) {
+      normalized.push(line);
+      continue;
+    }
+    var key = m[1];
+    if (seen[key]) continue; // prevent accidental duplicate option labels
+    seen[key] = true;
+    normalized.push(line); // keep original source order (no reordering/swapping)
+  }
+  return normalized;
+}
+
+function _isAnswerLine(line) {
+  return /^Answer\s*:\s*/i.test(line);
+}
+
+function _isExplanationLine(line) {
+  return /^Expla?nation\s*:\s*/i.test(line);
+}
+
+function _isHardBlockStart(line) {
+  var s = String(line || '').trim();
+  if (!s) return false;
+  if (_isQuestionLine(s)) return true;
+  if (_isFreeResponseQuestionLine(s)) return true;
+  if (_isTableLine(s)) return true;
+  if (/^\[FIGURE:\s*/i.test(s)) return true;
+  if (/^!\[[^\]]*\]\(([^)]+)\)/.test(s)) return true;
+  if (/^#{1,3}\s+/.test(s)) return true;
+  return false;
+}
+
+function _rebuildStructuredQuestionPayload(rawContent, section) {
+  var s = String(section || '').toLowerCase();
+  var isPractice = s.indexOf('practice questions') !== -1;
+  var isFr = s.indexOf('free response') !== -1;
+  if (!isPractice && !isFr) return '';
+
+  var parsed = null;
+  try {
+    if (typeof rawContent === 'string') {
+      var t = String(rawContent || '').trim();
+      if (t && ((t.charAt(0) === '{' && t.charAt(t.length - 1) === '}') || (t.charAt(0) === '[' && t.charAt(t.length - 1) === ']'))) {
+        parsed = JSON.parse(t);
+      }
+    } else if (rawContent && typeof rawContent === 'object') {
+      parsed = rawContent;
+    }
+  } catch (_) {
+    parsed = null;
+  }
+  if (!parsed) return '';
+
+  var out = [];
+  if (isPractice) {
+    var arr = Array.isArray(parsed.questions) ? parsed.questions : [];
+    if (!arr.length) return '';
+    for (var i = 0; i < arr.length; i++) {
+      var q = arr[i] || {};
+      var n = i + 1;
+      var st = String(q.statement || q.question || '').trim();
+      if (!st) continue;
+      out.push('Q' + n + '. ' + st);
+      var opts = q.options || {};
+      var keys = Object.keys(opts).sort();
+      for (var k = 0; k < keys.length; k++) {
+        var key = String(keys[k] || '').toUpperCase();
+        if (!/^[A-Z]$/.test(key)) continue;
+        var val = String(opts[keys[k]] || '').trim();
+        if (val) out.push('(' + key + ') ' + val);
+      }
+      if (q.correct_answer) out.push('Answer: ' + String(q.correct_answer).trim());
+      if (q.explanation) out.push('Explanation: ' + String(q.explanation).trim());
+      out.push('');
+    }
+  } else if (isFr) {
+    var frArr = Array.isArray(parsed.free_response_questions) ? parsed.free_response_questions : [];
+    if (!frArr.length) return '';
+    for (var j = 0; j < frArr.length; j++) {
+      var fr = frArr[j] || {};
+      var idx = j + 1;
+      var prompt = String(fr.prompt || '').trim();
+      if (!prompt) continue;
+      out.push('FRQ' + idx + '. ' + prompt);
+      if (fr.category) out.push('Category: ' + String(fr.category).trim());
+      if (fr.answer_framework) out.push('Answer Framework: ' + String(fr.answer_framework).trim());
+      if (fr.rationale) out.push('Rationale: ' + String(fr.rationale).trim());
+      out.push('');
+    }
+  }
+  return out.join('\n').trim();
+}
+
+function _ensureMandatoryDisclaimer(normalized, section) {
+  var s = String(section || '').toLowerCase();
+  if (s.indexOf('front_copyright') !== 0) return normalized;
+  var txt = String(normalized || '').trim();
+  if (!txt) return txt;
+  if (/disclaimer\s*:/i.test(txt) || /^\s*#{1,6}\s*disclaimer\b/im.test(txt)) return txt;
+
+  var required = [
+    '## Disclaimer',
+    'This study guide is intended strictly for educational and exam-preparation support.',
+    'It does not replace official syllabus documents, regulatory guidance, or professional judgment.',
+    'Always verify final decisions with current official references and your governing authority.'
+  ].join('\n');
+  return txt + '\n\n' + required;
+}
+
+function _isDomainTitle(text) {
+  return /^domain-\d+\s*:/i.test(String(text || '').trim());
+}
+
+function _isSubdomainTitle(text) {
+  var t = String(text || '').trim();
+  return /^subdomain-\d+\.\d+\s*:/i.test(t) || /^\d+\.\d+\s+/.test(t);
+}
+
+function _isOverviewTitle(text) {
+  return /^overview$/i.test(String(text || '').trim());
+}
+
+function _isPracticeHeading(text) {
+  return /^practice\s*questions?\b/i.test(String(text || '').trim());
+}
+
+function _isTableLine(line) {
+  var s = String(line || '').trim();
+  if (!s) return false;
+  // NOTE: Never treat comma-separated prose as CSV — normal sentences (“However, ...”) become false tables.
+  if (/^\|.*\|$/.test(s)) return true;      // markdown table row
+  if (/^\+[-+]+\+$/.test(s)) return true;   // ascii table border row
+  if ((s.match(/\t/g) || []).length >= 2) return true;  // deliberate TSV (≥2 tabs)
+  return false;
+}
+
+function _isTableSeparator(line) {
+  return /^\|\s*[:\-| ]+\|\s*$/.test(String(line || '').trim());
+}
+
+function _parseTableRow(line) {
+  var s = String(line || '').trim();
+  if (s.indexOf('|') === -1 && s.indexOf('\t') !== -1) {
+    return s.split('\t').map(function(cell) { return String(cell || '').trim(); });
+  }
+  if (s.indexOf('|') === -1 && s.indexOf(',') !== -1) {
+    return s.split(',').map(function(cell) { return String(cell || '').trim(); });
+  }
+  if (s.charAt(0) === '|') s = s.substring(1);
+  if (s.charAt(s.length - 1) === '|') s = s.substring(0, s.length - 1);
+  return s.split('|').map(function(cell) { return String(cell || '').trim(); });
+}
+
+function _numberToWord(numStr) {
+  var map = {
+    '0': 'ZERO', '1': 'ONE', '2': 'TWO', '3': 'THREE', '4': 'FOUR',
+    '5': 'FIVE', '6': 'SIX', '7': 'SEVEN', '8': 'EIGHT', '9': 'NINE',
+    '10': 'TEN', '11': 'ELEVEN', '12': 'TWELVE'
+  };
+  var k = String(numStr || '').trim();
+  return map[k] || k || 'ONE';
+}
+
+function _bodyHasVisibleText(body) {
+  try {
+    return String(body.getText() || '').replace(/\s/g, '').length > 0;
+  } catch (_) {
+    return true;
+  }
+}
+
+function _cleanInlineMarkers(text) {
+  return String(text || '')
+    .replace(/\$C/gi, '')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
+}
+
+function _wrapDisplayMathBlocks(blocks) {
+  if (!Array.isArray(blocks) || !blocks.length) return blocks || [];
+  var out = [];
+  var inDisplayMath = false;
+  for (var i = 0; i < blocks.length; i++) {
+    var b = blocks[i];
+    if (!b) continue;
+
+    if (b.type === 'H3') {
+      inDisplayMath = _isDisplayMathHeading(b.text);
+      out.push(b);
+      continue;
+    }
+
+    // Leave display math scope when a stronger structural block starts.
+    if (b.type === 'H1' || b.type === 'H2' || b.type === 'TABLE' || b.type === 'FIGURE' || b.type === 'INLINE_IMAGE' || b.type === 'QUESTION') {
+      inDisplayMath = false;
+      out.push(b);
+      continue;
+    }
+
+    if (inDisplayMath && b.type === 'PARA') {
+      var t = String(b.text || '').trim();
+      if (t && _looksLikeMathExpression(t) && !/^\$\$[\s\S]*\$\$$/.test(t)) {
+        b = { type: 'PARA', text: '$$ ' + t + ' $$' };
+      }
+    }
+    out.push(b);
+  }
+  return out;
+}
+
+function _splitLongParagraphBlocks(blocks) {
+  if (!Array.isArray(blocks) || !blocks.length) return blocks || [];
+  var out = [];
+  var MAX_CHUNK = 360;
+  for (var i = 0; i < blocks.length; i++) {
+    var b = blocks[i];
+    if (!b || b.type !== 'PARA') {
+      out.push(b);
+      continue;
+    }
+    var t = String(b.text || '').trim();
+    if (!t || t.length <= MAX_CHUNK || /\$\$/.test(t)) {
+      out.push(b);
+      continue;
+    }
+    var parts = _splitTextIntoChunks(t, MAX_CHUNK);
+    for (var j = 0; j < parts.length; j++) {
+      out.push({ type: 'PARA', text: parts[j] });
+    }
+  }
+  return out;
+}
+
+function _splitTextIntoChunks(text, maxLen) {
+  var s = String(text || '').trim();
+  if (!s) return [];
+  if (s.length <= maxLen) return [s];
+
+  // Try sentence-like split first.
+  var rough = s
+    .replace(/([.!?])\s+/g, '$1\n')
+    .split('\n')
+    .map(function (x) { return String(x || '').trim(); })
+    .filter(function (x) { return !!x; });
+  if (!rough.length) rough = [s];
+
+  var out = [];
+  var cur = '';
+  for (var i = 0; i < rough.length; i++) {
+    var seg = rough[i];
+    if (!seg) continue;
+    if (!cur) {
+      if (seg.length <= maxLen) {
+        cur = seg;
+      } else {
+        // Hard-wrap very long sentence.
+        var ws = seg.split(/\s+/);
+        var hard = '';
+        for (var k = 0; k < ws.length; k++) {
+          var cand = hard ? (hard + ' ' + ws[k]) : ws[k];
+          if (cand.length > maxLen && hard) {
+            out.push(hard);
+            hard = ws[k];
+          } else {
+            hard = cand;
+          }
+        }
+        if (hard) out.push(hard);
+      }
+      continue;
+    }
+    var next = cur + ' ' + seg;
+    if (next.length > maxLen) {
+      out.push(cur);
+      if (seg.length <= maxLen) {
+        cur = seg;
+      } else {
+        var words = seg.split(/\s+/);
+        var curHard = '';
+        for (var w = 0; w < words.length; w++) {
+          var c2 = curHard ? (curHard + ' ' + words[w]) : words[w];
+          if (c2.length > maxLen && curHard) {
+            out.push(curHard);
+            curHard = words[w];
+          } else {
+            curHard = c2;
+          }
+        }
+        cur = curHard;
+      }
+    } else {
+      cur = next;
+    }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+function _isDisplayMathHeading(text) {
+  var t = String(text || '').trim().toLowerCase();
+  return /^display\s*[-—:]\s*(formula|identity|equation|calculation|math|calculus)\b/.test(t);
+}
+
+function _looksLikeMathExpression(text) {
+  var t = String(text || '').trim();
+  if (!t) return false;
+  if (/\$\$[\s\S]*\$\$/.test(t)) return true;
+  if (/[=<>±×÷^]/.test(t)) return true;
+  if (/(sin|cos|tan|log|ln|sqrt|sigma|theta|alpha|beta|integral|derivative)\b/i.test(t)) return true;
+  if (/\d/.test(t) && /[a-zA-Z]/.test(t) && /[+\-*/()]/.test(t)) return true;
+  return false;
+}
